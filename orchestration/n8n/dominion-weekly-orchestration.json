@@ -1,0 +1,139 @@
+{
+  "name": "Dominion — Weekly Utility Orchestration (WS-1 → WS-2)",
+  "active": false,
+  "settings": {
+    "timezone": "America/New_York",
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      },
+      "name": "Monday 8AM ET Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-80, 300],
+      "notes": "Fires the weekly run every Monday 08:00 America/New_York (set in workflow timezone)."
+    },
+    {
+      "parameters": {
+        "command": "cd \"{{ $env.DOMINION_PROJECT_DIR }}\" && npx tsx scripts/ws1-orchestrate.ts"
+      },
+      "name": "WS-1 Orchestrate",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [180, 300],
+      "notes": "Pulls the property list + Podio overrides from Abdul's Postgres (no AppFolio/Podio APIs), ingests QuickBooks CSVs, writes cache/ws1-latest.json. exit 0=SUCCESS, 2=EMPTY, 1=FAILED."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json[\"exitCode\"] }}",
+              "operation": "equal",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "name": "WS-1 Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "command": "cd \"{{ $env.DOMINION_PROJECT_DIR }}\" && npx tsx scripts/ws2-route.ts --payload cache/ws1-latest.json"
+      },
+      "name": "WS-2 Route",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [720, 200],
+      "notes": "Routing Logic Engine. Routes each property to BGE-pay / Water-pay / Tenant-skip / Exception, writes routing_decision + consumption_anomaly to Postgres and cache/ws2-latest.json. Sends its own batched Outlook ping for consumption anomalies/exceptions."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json[\"exitCode\"] }}",
+              "operation": "equal",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "name": "WS-2 Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [980, 200]
+    },
+    {
+      "parameters": {},
+      "name": "Continue to WS-3/WS-4",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1240, 120],
+      "notes": "Placeholder — bill-retrieval runs of the BGE (WS-3) and water (WS-4) agents attach here once their payment-mode hardening lands."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OUTLOOK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ subject: 'Dominion weekly orchestration FAILED — exitCode ' + $json[\"exitCode\"], severity: 'critical', source: 'WS-1/WS-2 orchestration', run_id: '', body: (($json[\"stderr\"] || $json[\"stdout\"] || 'no output').toString().slice(0, 3000)) }) }}",
+        "options": {}
+      },
+      "name": "WS-6 Outlook Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [980, 440],
+      "notes": "Posts the failure (including the stderr JSON line from the failing script) to the WS-6 Outlook channel: a Power Automate HTTP-trigger flow that emails the ops mailbox. OUTLOOK_WEBHOOK_URL set in the n8n env/credential store. Replaces the former Slack webhook."
+    },
+    {
+      "parameters": {},
+      "name": "Halt Run",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1240, 440],
+      "notes": "Run halts here on failure — no payment workstreams fire without a clean WS-1 → WS-2 handoff."
+    }
+  ],
+  "connections": {
+    "Monday 8AM ET Cron": {
+      "main": [[{ "node": "WS-1 Orchestrate", "type": "main", "index": 0 }]]
+    },
+    "WS-1 Orchestrate": {
+      "main": [[{ "node": "WS-1 Succeeded?", "type": "main", "index": 0 }]]
+    },
+    "WS-1 Succeeded?": {
+      "main": [
+        [{ "node": "WS-2 Route", "type": "main", "index": 0 }],
+        [{ "node": "WS-6 Outlook Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "WS-2 Route": {
+      "main": [[{ "node": "WS-2 Succeeded?", "type": "main", "index": 0 }]]
+    },
+    "WS-2 Succeeded?": {
+      "main": [
+        [{ "node": "Continue to WS-3/WS-4", "type": "main", "index": 0 }],
+        [{ "node": "WS-6 Outlook Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "WS-6 Outlook Alert": {
+      "main": [[{ "node": "Halt Run", "type": "main", "index": 0 }]]
+    }
+  }
+}

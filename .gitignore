@@ -1,0 +1,17 @@
+# Secrets — credentials, Graph secret, DB password (Phase 2 constraint #3).
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Runtime output
+cache/                 # WS-1 payloads + offline audit logs (contain client data)
+screenshots/
+test-results/
+playwright-report/
+
+# Editor / OS
+.DS_Store
+Thumbs.db

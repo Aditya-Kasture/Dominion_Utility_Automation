@@ -1,0 +1,53 @@
+{
+  "name": "dominion_playwright",
+  "version": "1.0.0",
+  "description": "BGE and Water portal automation for The Dominion Group",
+  "main": "index.js",
+  "scripts": {
+    "bge:audit": "cross-env BGE_MODE=audit HEADLESS=false npx playwright test tests/bge.spec.ts --project=chromium",
+    "bge:paperless": "cross-env BGE_MODE=paperless npx playwright test tests/bge.spec.ts --project=chromium",
+    "bge:bills": "cross-env BGE_MODE=bills npx playwright test tests/bge.spec.ts --project=chromium",
+    "bge:full": "cross-env BGE_MODE=full npx playwright test tests/bge.spec.ts --project=chromium",
+    "water:audit": "cross-env WATER_MODE=audit HEADLESS=false npx playwright test tests/water.spec.ts --project=chromium",
+    "water:paperless": "cross-env WATER_MODE=paperless npx playwright test tests/water.spec.ts --project=chromium",
+    "water:bills": "cross-env WATER_MODE=bills npx playwright test tests/water.spec.ts --project=chromium",
+    "water:full": "cross-env WATER_MODE=full npx playwright test tests/water.spec.ts --project=chromium",
+    "ws1:run": "tsx scripts/ws1-orchestrate.ts",
+    "ws1:dry-run": "tsx scripts/ws1-orchestrate.ts --dry-run",
+    "ws2:route": "tsx scripts/ws2-route.ts",
+    "ws2:dry-run": "tsx scripts/ws2-route.ts --dry-run",
+    "ws2:test": "playwright test tests/ws2-routing.spec.ts --project=chromium",
+    "import:bge-mapping": "tsx scripts/import-bge-mapping.ts",
+    "import:bge-xlsx": "tsx scripts/import-bge-from-xlsx.ts",
+    "import:quickbooks": "tsx scripts/import-quickbooks.ts",
+    "import:water-mapping": "tsx scripts/import-water-mapping.ts",
+    "import:water-xlsx": "tsx scripts/import-water-from-xlsx.ts",
+    "cache:water": "tsx scripts/cache-water-accounts.ts",
+    "db:diagnose": "tsx scripts/db-diagnose.ts",
+    "db:fix-water-fk": "tsx scripts/fix-water-fk.ts",
+    "match:water-gemini": "tsx scripts/match-water-with-gemini.ts",
+    "reset:water-map": "tsx scripts/reset-water-map.ts"
+  },
+  "keywords": [],
+  "author": "The Dominion Group",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@types/imap-simple": "^4.2.10",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^25.6.0",
+    "@types/pg": "^8.11.0",
+    "cross-env": "^7.0.3",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@types/imap": "^0.8.43",
+    "dotenv": "^16.4.5",
+    "imap-simple": "^5.1.0",
+    "mailparser": "^3.9.9",
+    "pg": "^8.13.0",
+    "xlsx": "^0.18.5"
+  }
+}
