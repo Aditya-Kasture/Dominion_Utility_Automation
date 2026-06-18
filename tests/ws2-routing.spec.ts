@@ -578,3 +578,35 @@ test('configFromEnv honors overrides and rejects junk', () => {
   expect(cfg.letterMultiplier).toBe(2);
   expect(cfg.moderateSpikeMultiplier).toBe(2); // alias kept in sync
 });
+
+// ─── Hardening: water-skip escape hatch, landlord verbiage at work-order tier ──
+
+test('Podio "skip water" override is the only escape from water-lien PAY', () => {
+  // Override is step 1; water-lien PAY is step 4. A scoped skip is the sole way
+  // a water utility ever leaves the auto-PAY path — lock that precedence.
+  const d = decision(prop({
+    manual_overrides: [{ source: 'podio', field: 'override', value: 'skip water' }],
+  }), 'water');
+  expect(d.decision).toBe('SKIP');
+  expect(d.reason_code).toBe(REASON.MANUAL_OVERRIDE_SKIP);
+});
+
+test('water_billable false at >3× tier → landlord-verbiage letter AND work order both emit', () => {
+  const p = prop({
+    water_billable: false,
+    consumption_baselines: [{ unit_id: 10, utility_type: 'water', period_unit: 'quarterly', baseline_amount: 20 }],
+  });
+  const r = routeProperty(p, DEFAULT_CONFIG, new Map([[10, 70]])); // 3.5× expected
+  expect(r.letters).toHaveLength(1);
+  expect(r.letters[0].responsibility).toBe('landlord');
+  expect(r.letters[0].tier).toBe('LETTER_PLUS_WORKORDER');
+  expect(r.work_orders).toHaveLength(1);
+});
+
+test('decision-trail last step reflects the final decision (not just non-empty)', () => {
+  const r = routeProperty(prop()); // BGE tenant+occupied → SKIP; water → PAY
+  const bge = r.decisions.find(d => d.utility === 'bge')!;
+  const water = r.decisions.find(d => d.utility === 'water')!;
+  expect(bge.trail[bge.trail.length - 1].outcome).toMatch(/SKIP/);
+  expect(water.trail[water.trail.length - 1].outcome).toMatch(/PAY/);
+});
