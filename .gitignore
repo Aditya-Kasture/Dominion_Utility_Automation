@@ -15,3 +15,11 @@ playwright-report/
 # Editor / OS
 .DS_Store
 Thumbs.db
+
+# Internal tooling / non-runtime artifacts (kept local, not published)
+CLAUDE.md
+*.docx
+.claude/
+.claude-flow/
+.swarm/
+ruvector.db
