@@ -66,6 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_water_log_run_at  ON water_portal_audit_log(run_a
 CREATE INDEX IF NOT EXISTS idx_water_log_threshold ON water_portal_audit_log(threshold_action)
   WHERE threshold_action IN ('pay_alert_pm', 'pay_work_order');
 
+-- June 19 2026: bill window captured at retrieval so WS-2 can prorate mid-cycle
+-- move-ins (Method A). Stored as TEXT (YYYY-MM-DD) to match the portal scrape.
+-- Additive — safe to re-run.
+ALTER TABLE water_portal_audit_log ADD COLUMN IF NOT EXISTS period_start TEXT;
+ALTER TABLE water_portal_audit_log ADD COLUMN IF NOT EXISTS period_end   TEXT;
+-- 'payment' is now also a valid action (WS-4 pay mode); no enum to alter (TEXT).
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. Water Account → Unit/Property mapping

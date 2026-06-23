@@ -21,13 +21,20 @@
 
 import { test, expect, Page, BrowserContext } from '@playwright/test';
 import * as dotenv from 'dotenv';
-import { fetchWaterAccounts, logWaterRun, closePool, WaterAccount, validateEnv } from './helpers/db';
+import {
+  fetchWaterAccounts, logWaterRun, closePool, WaterAccount, validateEnv,
+  fetchPaymentApprovals, recordPaymentAttempt, isPaymentConfirmed, paymentIdempotencyKey,
+  PaymentApproval,
+} from './helpers/db';
+import { fetchWaterOtpFromGraph, waitForManualOtp } from './helpers/emailOTP';
 import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot, determineWaterAction, getRandomUserAgent, detectBotBlock } from './helpers/utils';
 
 dotenv.config();
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const VALID_MODES = ['audit', 'paperless', 'bills', 'full'] as const;
+// June 19 2026: 'pay' executes approval-gated payments (see WS-4). Payment never
+// fires without a payment_approval row for this RUN_ID + account.
+const VALID_MODES = ['audit', 'paperless', 'bills', 'pay', 'full'] as const;
 type Mode = typeof VALID_MODES[number];
 const rawMode = process.env.WATER_MODE ?? 'full';
 if (!VALID_MODES.includes(rawMode as Mode)) throw new Error(`Invalid WATER_MODE: "${rawMode}". Must be: ${VALID_MODES.join(', ')}`);
@@ -38,6 +45,8 @@ const MODE = rawMode as Mode;
 const LOGIN_URL = process.env.WATER_LOGIN_URL ?? 'https://waterbillportal.baltimorecity.gov';
 const WATER_EMAIL = process.env.WATER_EMAIL ?? '';
 const WATER_PASSWORD = process.env.WATER_PASSWORD ?? '';
+// Run identifier — ties payments to a WS-2 run's approvals. Required for 'pay'.
+const RUN_ID = process.env.RUN_ID ?? process.env.WS2_RUN_ID ?? '';
 
 let context: BrowserContext;
 let page: Page;
@@ -137,10 +146,56 @@ test('Water Portal Login', async () => {
 
     const signInBtn = page.getByRole('button', { name: /^(sign in|log in|continue|next|submit)$/i }).first();
     console.log('[Water] Clicking Sign In...');
+    const loginSubmittedAt = new Date();
     await signInBtn.click();
     console.log('[Water] Submitted — waiting for landing page.');
     await page.waitForLoadState('domcontentloaded').catch(() => null);
     await page.waitForTimeout(3000);
+
+    // ── OTP step (June 19) ─────────────────────────────────────────────────────
+    // Baltimore Water (Azure B2C) may present an emailed verification code, same
+    // as BGE. Detect the OTP field; if it appears, pull the code from the shared
+    // Outlook mailbox via Graph and submit it. Mirrors tests/bge.spec.ts.
+    const otpField = page
+      .locator(
+        'input[id*="otp" i], input[name*="otp" i], input[aria-label*="code" i], ' +
+        'input[aria-label*="verification" i], input[placeholder*="code" i], ' +
+        'input[autocomplete="one-time-code"], input[inputmode="numeric"]'
+      )
+      .or(page.getByLabel(/verification code|one[-\s]?time|otp/i))
+      .first();
+
+    const otpVisible = await otpField.isVisible({ timeout: 8_000 }).catch(() => false);
+    if (otpVisible) {
+      console.log('[Water] OTP field detected — fetching code from Graph API...');
+      const code = await fetchWaterOtpFromGraph({
+        since: new Date(loginSubmittedAt.getTime() - 30_000),
+        maxWaitMs: 3 * 60_000,
+        pollIntervalMs: 5_000,
+      });
+      if (code) {
+        await otpField.fill(code);
+        await otpField.blur().catch(() => null);
+        await randomDelay(500, 200);
+        const continueBtn = page.locator('button:has-text("Continue")').first()
+          .or(page.locator('button:has-text("Verify")').first())
+          .or(page.locator('button:has-text("Submit")').first())
+          .or(page.locator('button[type="submit"]').first());
+        await continueBtn.click({ timeout: 8_000 }).catch(async () => {
+          await otpField.press('Enter').catch(() => null);
+        });
+        await otpField.waitFor({ state: 'hidden', timeout: 60_000 }).catch(() =>
+          console.warn('[Water] OTP field did not clear within 60s — continuing to landing check.')
+        );
+        console.log('[Water] OTP submitted.');
+      } else {
+        console.warn('[Water] OTP auto-fetch failed — falling back to manual paste.');
+        await waitForManualOtp(page, otpField, 15 * 60_000);
+      }
+      await page.waitForTimeout(2000);
+    } else {
+      console.log('[Water] No OTP step detected — proceeding.');
+    }
   } else {
     await screenshot(page, 'water_unknown_state');
     throw new Error(`Water portal landed on an unrecognized page. URL: ${page.url()}`);
@@ -193,7 +248,7 @@ test('Water Paperless Enrollment (all units)', async () => {
 
 test('Water Bill Retrieval (all units)', async () => {
   if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
-  if (MODE === 'audit' || MODE === 'paperless') {
+  if (MODE === 'audit' || MODE === 'paperless' || MODE === 'pay') {
     test.skip(true, `Mode is ${MODE} — skipping bill retrieval.`);
     return;
   }
@@ -218,7 +273,8 @@ test('Water Bill Retrieval (all units)', async () => {
   const csvHeader = [
     'timestamp','unit_id','unit_name','property_id','water_account_number',
     'street1','city','state','zip',
-    'bill_amount','due_date','consumption_units','threshold_action','status','notes',
+    'bill_amount','due_date','consumption_units','period_start','period_end',
+    'threshold_action','status','notes',
   ].join(',') + '\n';
   fs.writeFileSync(csvPath, csvHeader, 'utf8');
   console.log(`[Water] CSV: ${csvPath}`);
@@ -241,7 +297,7 @@ test('Water Bill Retrieval (all units)', async () => {
       fs.appendFileSync(csvPath, [
         new Date().toISOString(), unit.unit_id, unit.unit_name, unit.property_id,
         unit.water_account_number, unit.street1, unit.city, unit.state, unit.zip,
-        '', '', '', '', 'NAV_FAILED', 'Account not found in portal',
+        '', '', '', '', '', '', 'NAV_FAILED', 'Account not found in portal',
       ].map(csvEscape).join(',') + '\n', 'utf8');
       try { await logWaterRun({ unit_id: unit.unit_id, property_id: unit.property_id, action: 'navigate', status: 'FAILED', notes: 'Address not found in portal' }); } catch (e) { console.error(`[Water] Log failed for ${address}:`, e); }
       continue;
@@ -260,6 +316,7 @@ test('Water Bill Retrieval (all units)', async () => {
       new Date().toISOString(), unit.unit_id, unit.unit_name, unit.property_id,
       unit.water_account_number, unit.street1, unit.city, unit.state, unit.zip,
       bill.amount ?? '', bill.dueDate ?? '', bill.consumptionUnits ?? '',
+      bill.periodStart ?? '', bill.periodEnd ?? '',
       thresholdAction, status, notes,
     ].map(csvEscape).join(',') + '\n', 'utf8');
 
@@ -274,6 +331,8 @@ test('Water Bill Retrieval (all units)', async () => {
         due_date: bill.dueDate,
         threshold_action: thresholdAction,
         notes,
+        period_start: bill.periodStart,
+        period_end: bill.periodEnd,
       });
     } catch (e) { console.error(`[Water] Log failed for ${address}:`, e); }
 
@@ -290,7 +349,177 @@ test('Water Bill Retrieval (all units)', async () => {
   console.log(`[Water] CSV written: ${csvPath}`);
 });
 
+// ─── Test 4: Payment (approved units only) ────────────────────────────────────
+
+test('Water Payment (approved units only)', async () => {
+  if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
+  if (MODE !== 'pay' && MODE !== 'full') {
+    test.skip(true, `Mode is ${MODE} — skipping payment.`);
+    return;
+  }
+  if (!RUN_ID) {
+    throw new Error('RUN_ID (or WS2_RUN_ID) is required for pay mode — payments are gated per WS-2 run.');
+  }
+
+  const actionable = units.filter(u => !!u.water_account_number);
+  const budgetMs = Math.max(5 * 60_000, Math.min(6 * 60 * 60_000, actionable.length * 60_000));
+  test.setTimeout(budgetMs);
+
+  // Approval gate (June 19): pay ONLY accounts with a payment_approval row for
+  // this run. No approval → SKIPPED_NO_APPROVAL, never submit.
+  const approvals = await fetchPaymentApprovals(RUN_ID, 'water');
+  console.log(`[Water] Payment run ${RUN_ID}: ${approvals.size} approved account(s) of ${actionable.length} actionable.`);
+
+  let paid = 0, skipped = 0, failed = 0;
+
+  for (const unit of actionable) {
+    const acct = unit.water_account_number!;
+    const address = `${unit.street1}, ${unit.city}`;
+    const approval: PaymentApproval | undefined = approvals.get(String(acct));
+
+    if (!approval) {
+      skipped++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: unit.property_id, unit_id: unit.unit_id,
+        utility: 'water', account_number: acct, amount: null, status: 'SKIPPED_NO_APPROVAL',
+      });
+      continue;
+    }
+
+    // Idempotency: if this exact payment is already CONFIRMED, never re-submit.
+    const key = paymentIdempotencyKey(RUN_ID, 'water', acct, approval.approved_amount ?? null);
+    if (await isPaymentConfirmed(key)) {
+      console.log(`[Water] ${acct} already CONFIRMED — skipping (idempotent).`);
+      continue;
+    }
+
+    const found = await navigateToUnit(page, unit);
+    if (!found) {
+      failed++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: unit.property_id, unit_id: unit.unit_id,
+        utility: 'water', account_number: acct, amount: approval.approved_amount ?? null,
+        status: 'FAILED', error: 'Account not found in portal',
+      });
+      continue;
+    }
+
+    // Amount: the approved amount if given, else whatever the bill currently shows.
+    let amount = approval.approved_amount;
+    if (amount == null) {
+      const bill = await retrieveWaterBill(page, address);
+      amount = bill.amount;
+    }
+    if (amount == null || amount <= 0) {
+      skipped++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: unit.property_id, unit_id: unit.unit_id,
+        utility: 'water', account_number: acct, amount, status: 'FAILED',
+        error: 'No payable amount (approved_amount null and bill amount unreadable/zero)',
+      });
+      continue;
+    }
+
+    await recordPaymentAttempt({
+      run_id: RUN_ID, property_id: unit.property_id, unit_id: unit.unit_id,
+      utility: 'water', account_number: acct, amount, status: 'SUBMITTED',
+    });
+
+    const res = await submitWaterPayment(page, unit, amount);
+    if (res.ok) {
+      paid++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: unit.property_id, unit_id: unit.unit_id,
+        utility: 'water', account_number: acct, amount, status: 'CONFIRMED',
+        confirmation_ref: res.confirmationRef,
+      });
+    } else {
+      failed++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: unit.property_id, unit_id: unit.unit_id,
+        utility: 'water', account_number: acct, amount, status: 'FAILED', error: res.error,
+      });
+    }
+    try {
+      await logWaterRun({
+        unit_id: unit.unit_id, property_id: unit.property_id, action: 'payment',
+        status: res.ok ? 'SUCCESS' : 'FAILED', bill_amount: amount,
+        notes: res.ok ? `Paid $${amount} (conf ${res.confirmationRef ?? 'n/a'})` : `Payment failed: ${res.error}`,
+      });
+    } catch (e) { console.error(`[Water] Payment log failed for ${address}:`, e); }
+
+    await randomDelay(2000, 1000);
+  }
+
+  console.log(`[Water] Payment done. PAID=${paid}, SKIPPED_NO_APPROVAL/zero=${skipped}, FAILED=${failed}.`);
+});
+
 // ─── Helper Functions ─────────────────────────────────────────────────────────
+
+/**
+ * Submits a one-time payment for the currently-open account on the Baltimore
+ * Water portal. Approval-gated by the caller. Best-effort selectors — run
+ * WATER_MODE=audit HEADLESS=false first to confirm the Pay flow, then refine.
+ *
+ * Flow: Pay / Make a payment button → amount field (prefilled or typed) →
+ * confirm → capture a confirmation number. Returns ok=false (never throws) so a
+ * single failure can't abort the batch; the caller records the attempt either way.
+ */
+async function submitWaterPayment(
+  page: Page, unit: WaterAccount, amount: number
+): Promise<{ ok: boolean; confirmationRef: string | null; error?: string }> {
+  const acct = unit.water_account_number ?? '';
+  try {
+    const payBtn = page.getByRole('button', { name: /^(pay|pay bill|make a payment|pay now)$/i })
+      .or(page.getByRole('link', { name: /^(pay|pay bill|make a payment|pay now)$/i }))
+      .first();
+    if (!(await payBtn.isVisible({ timeout: 8_000 }).catch(() => false))) {
+      await screenshot(page, `water_no_pay_button_${acct}`);
+      return { ok: false, confirmationRef: null, error: 'Pay button not found' };
+    }
+    await payBtn.click();
+    await page.waitForTimeout(1500);
+
+    // Amount field may be prefilled with the balance; if editable, set our amount.
+    const amountField = page.getByLabel(/amount/i)
+      .or(page.locator('input[name*="amount" i], input[id*="amount" i]'))
+      .first();
+    if (await amountField.isVisible({ timeout: 4_000 }).catch(() => false)) {
+      const editable = await amountField.isEditable().catch(() => false);
+      if (editable) {
+        await amountField.fill(String(amount.toFixed(2)));
+        await randomDelay(300, 200);
+      }
+    }
+
+    const confirmBtn = page.getByRole('button', {
+      name: /^(confirm|submit payment|pay \$?[\d.,]+|continue|review and pay|authorize)$/i,
+    }).first();
+    if (!(await confirmBtn.isVisible({ timeout: 6_000 }).catch(() => false))) {
+      await screenshot(page, `water_no_confirm_button_${acct}`);
+      return { ok: false, confirmationRef: null, error: 'Payment confirm button not found' };
+    }
+    await confirmBtn.click();
+
+    // A second confirm step is common; click it if present.
+    const finalConfirm = page.getByRole('button', { name: /^(confirm|submit|pay now|authorize|yes)$/i }).first();
+    if (await finalConfirm.isVisible({ timeout: 5_000 }).catch(() => false)) {
+      await finalConfirm.click().catch(() => null);
+    }
+    await page.waitForTimeout(3000);
+
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    const confMatch = bodyText.match(/confirmation\s*(?:number|#|no\.?|code)?[:\s]+([A-Z0-9-]{4,})/i);
+    const succeeded = /payment.*(?:successful|received|submitted|complete)|thank you/i.test(bodyText) || !!confMatch;
+    await screenshot(page, `water_payment_${succeeded ? 'success' : 'unconfirmed'}_${acct}`);
+
+    if (!succeeded) return { ok: false, confirmationRef: null, error: 'No success/confirmation indicator after submit' };
+    return { ok: true, confirmationRef: confMatch ? confMatch[1] : null };
+  } catch (err: any) {
+    await screenshot(page, `water_payment_error_${acct}`);
+    return { ok: false, confirmationRef: null, error: err?.message ?? String(err) };
+  }
+}
 
 /**
  * Navigates the Baltimore Water portal to a specific account:
@@ -464,8 +693,13 @@ async function enableWaterPaperless(page: Page, address: string): Promise<boolea
 async function retrieveWaterBill(
   page: Page,
   address: string
-): Promise<{ amount: number | null; dueDate: string | null; consumptionUnits: number | null }> {
-  const result = { amount: null as number | null, dueDate: null as string | null, consumptionUnits: null as number | null };
+): Promise<{ amount: number | null; dueDate: string | null; consumptionUnits: number | null;
+            periodStart: string | null; periodEnd: string | null }> {
+  const result = {
+    amount: null as number | null, dueDate: null as string | null,
+    consumptionUnits: null as number | null,
+    periodStart: null as string | null, periodEnd: null as string | null,
+  };
   try {
     const bodyText = await page.locator('body').innerText();
 
@@ -536,9 +770,23 @@ async function retrieveWaterBill(
       }
     }
 
+    // Bill period (June 19): WS-2 proration needs the bill window. The summary/
+    // billing area shows a service period like "Service period: 05/01/2026 -
+    // 05/31/2026" or "Billing period 05/01/2026 to 05/31/2026". Capture both ends.
+    const periodMatch = bodyText.match(
+      /(?:service|billing|bill)\s*period[:\s]*\(?\s*(\d{1,2}\/\d{1,2}\/\d{2,4})\s*(?:-|–|to|through|thru)\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i
+    ) || bodyText.match(
+      /(\d{1,2}\/\d{1,2}\/\d{2,4})\s*(?:-|–|to|through|thru)\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/
+    );
+    if (periodMatch) {
+      result.periodStart = parseDate(periodMatch[1]) ?? periodMatch[1];
+      result.periodEnd   = parseDate(periodMatch[2]) ?? periodMatch[2];
+    }
+
     console.log(
       `[Water] ${address} — Amount: $${result.amount ?? 'N/A'}, ` +
-      `Due: ${result.dueDate ?? 'N/A'}, Consumption: ${result.consumptionUnits ?? 'N/A'} units`
+      `Due: ${result.dueDate ?? 'N/A'}, Consumption: ${result.consumptionUnits ?? 'N/A'} units, ` +
+      `Period: ${result.periodStart ?? '?'} → ${result.periodEnd ?? '?'}`
     );
   } catch (err) {
     console.error(`[Water] Error retrieving bill for ${address}:`, err);

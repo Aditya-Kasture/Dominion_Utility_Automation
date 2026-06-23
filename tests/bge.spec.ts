@@ -17,7 +17,11 @@
 import path from 'path';
 import { test, expect, Page, BrowserContext } from '@playwright/test';
 import * as dotenv from 'dotenv';
-import { logBGERun, closePool, BGEAccount, validateEnv } from './helpers/db';
+import {
+  logBGERun, closePool, BGEAccount, validateEnv,
+  fetchPaymentApprovals, recordPaymentAttempt, isPaymentConfirmed, paymentIdempotencyKey,
+  PaymentApproval,
+} from './helpers/db';
 import { fetchBGEOtp, waitForManualOtp, fetchBGEOtpFromGraph } from './helpers/emailOTP';
 import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot, getRandomUserAgent, detectBotBlock } from './helpers/utils';
 import {
@@ -30,11 +34,15 @@ import {
 dotenv.config();
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const VALID_MODES = ['audit', 'paperless', 'bills', 'full'] as const;
+// June 19 2026: 'pay' executes approval-gated payments (see WS-3). Payment never
+// fires without a payment_approval row for this RUN_ID + account.
+const VALID_MODES = ['audit', 'paperless', 'bills', 'pay', 'full'] as const;
 type Mode = typeof VALID_MODES[number];
 const rawMode = process.env.BGE_MODE ?? 'full';
 if (!VALID_MODES.includes(rawMode as Mode)) throw new Error(`Invalid BGE_MODE: "${rawMode}". Must be: ${VALID_MODES.join(', ')}`);
 const MODE = rawMode as Mode;
+// Run identifier — ties payments to a WS-2 run's approvals. Required for 'pay'.
+const RUN_ID = process.env.RUN_ID ?? process.env.WS2_RUN_ID ?? '';
 const LOGIN_URL = process.env.BGE_LOGIN_URL ?? 'https://myaccount.bge.com/sign-in';
 const BGE_EMAIL = process.env.BGE_EMAIL ?? '';
 const BGE_PASSWORD = process.env.BGE_PASSWORD ?? '';
@@ -295,7 +303,7 @@ test('BGE Login (email + password + OTP)', async () => {
 
 test('BGE Paperless Enrollment (all accounts)', async () => {
   if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
-  if (MODE === 'audit' || MODE === 'bills') {
+  if (MODE === 'audit' || MODE === 'bills' || MODE === 'pay') {
     test.skip(true, `Mode is ${MODE} — skipping paperless enrollment.`);
     return;
   }
@@ -339,7 +347,7 @@ test('BGE Paperless Enrollment (all accounts)', async () => {
 
 test('BGE Bill Retrieval (all accounts)', async () => {
   if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
-  if (MODE === 'audit' || MODE === 'paperless') {
+  if (MODE === 'audit' || MODE === 'paperless' || MODE === 'pay') {
     test.skip(true, `Mode is ${MODE} — skipping bill retrieval.`);
     return;
   }
@@ -380,7 +388,175 @@ test('BGE Bill Retrieval (all accounts)', async () => {
   }
 });
 
+// ─── Test 4: Payment (approved accounts only) ─────────────────────────────────
+
+test('BGE Payment (approved accounts only)', async () => {
+  if (!loginSucceeded) { test.skip(true, 'Login did not succeed.'); return; }
+  if (MODE !== 'pay' && MODE !== 'full') {
+    test.skip(true, `Mode is ${MODE} — skipping payment.`);
+    return;
+  }
+  if (!RUN_ID) {
+    throw new Error('RUN_ID (or WS2_RUN_ID) is required for pay mode — payments are gated per WS-2 run.');
+  }
+  test.setTimeout(150 * 60 * 1000);
+
+  // Approval gate (June 19): pay ONLY accounts with a payment_approval row for
+  // this run. No approval → SKIPPED_NO_APPROVAL, never submit.
+  const approvals = await fetchPaymentApprovals(RUN_ID, 'bge');
+  console.log(`[BGE] Payment run ${RUN_ID}: ${approvals.size} approved account(s) of ${accounts.length}.`);
+
+  let paid = 0, skipped = 0, failed = 0;
+
+  for (const account of accounts) {
+    const { bge_account_number: acctNum, property_id: propId, property_name: propName } = account;
+    const approval: PaymentApproval | undefined = approvals.get(String(acctNum));
+
+    if (!approval) {
+      skipped++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: propId, utility: 'bge', account_number: acctNum,
+        amount: null, status: 'SKIPPED_NO_APPROVAL',
+      });
+      continue;
+    }
+
+    // Idempotency: if this exact payment is already CONFIRMED, never re-submit.
+    const key = paymentIdempotencyKey(RUN_ID, 'bge', acctNum, approval.approved_amount ?? null);
+    if (await isPaymentConfirmed(key)) {
+      console.log(`[BGE] ${acctNum} already CONFIRMED — skipping (idempotent).`);
+      continue;
+    }
+
+    console.log(`[BGE] Paying ${acctNum} (${propName})`);
+    const found = await navigateToAccount(page, acctNum);
+    if (!found) {
+      failed++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: propId, utility: 'bge', account_number: acctNum,
+        amount: approval.approved_amount ?? null, status: 'FAILED', error: 'Account not found in portal',
+      });
+      continue;
+    }
+
+    // Amount: approved amount if given, else whatever the dashboard bill shows.
+    let amount = approval.approved_amount;
+    if (amount == null) {
+      const bill = await retrieveBill(page, acctNum);
+      amount = bill.amount;
+    }
+    if (amount == null || amount <= 0) {
+      skipped++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: propId, utility: 'bge', account_number: acctNum,
+        amount, status: 'FAILED',
+        error: 'No payable amount (approved_amount null and bill amount unreadable/zero)',
+      });
+      continue;
+    }
+
+    await recordPaymentAttempt({
+      run_id: RUN_ID, property_id: propId, utility: 'bge', account_number: acctNum,
+      amount, status: 'SUBMITTED',
+    });
+
+    const res = await submitPayment(page, acctNum, amount);
+    if (res.ok) {
+      paid++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: propId, utility: 'bge', account_number: acctNum,
+        amount, status: 'CONFIRMED', confirmation_ref: res.confirmationRef,
+      });
+    } else {
+      failed++;
+      await recordPaymentAttempt({
+        run_id: RUN_ID, property_id: propId, utility: 'bge', account_number: acctNum,
+        amount, status: 'FAILED', error: res.error,
+      });
+    }
+    try {
+      await logBGERun({
+        bge_account_number: acctNum, property_id: propId, action: 'payment',
+        status: res.ok ? 'SUCCESS' : 'FAILED', bill_amount: amount,
+        notes: res.ok ? `Paid $${amount} (conf ${res.confirmationRef ?? 'n/a'})` : `Payment failed: ${res.error}`,
+      });
+    } catch (e) { console.error(`[BGE] Payment log failed for ${acctNum}:`, e); }
+
+    await randomDelay(2000, 1000);
+  }
+
+  console.log(`[BGE] Payment done. PAID=${paid}, SKIPPED_NO_APPROVAL/zero=${skipped}, FAILED=${failed}.`);
+});
+
 // ─── Helper Functions ─────────────────────────────────────────────────────────
+
+/**
+ * Submits a one-time payment for the currently-open BGE account. Approval-gated
+ * by the caller. Best-effort selectors — run BGE_MODE=audit HEADLESS=false first
+ * to confirm the Pay flow, then refine. Returns ok=false (never throws) so one
+ * failure can't abort the batch; the caller records the attempt either way.
+ *
+ * Flow: "Pay" / "Make a Payment" → amount field (prefilled or typed) → choose
+ * saved payment method → confirm → capture confirmation number.
+ */
+async function submitPayment(
+  page: Page, accountNumber: string, amount: number
+): Promise<{ ok: boolean; confirmationRef: string | null; error?: string }> {
+  try {
+    await dismissPopups(page, accountNumber);
+    const payBtn = page.getByRole('link', { name: /^(pay|pay bill|make a payment|pay now)$/i })
+      .or(page.getByRole('button', { name: /^(pay|pay bill|make a payment|pay now)$/i }))
+      .first();
+    if (!(await payBtn.isVisible({ timeout: 8_000 }).catch(() => false))) {
+      await screenshot(page, `bge_no_pay_button_${accountNumber}`);
+      return { ok: false, confirmationRef: null, error: 'Pay button not found' };
+    }
+    await payBtn.click();
+    await page.waitForTimeout(2000);
+    await dismissPopups(page, accountNumber);
+
+    // Amount field — usually prefilled with the balance; set it when editable.
+    const amountField = page.getByLabel(/amount/i)
+      .or(page.locator('input[name*="amount" i], input[id*="amount" i]'))
+      .first();
+    if (await amountField.isVisible({ timeout: 4_000 }).catch(() => false)) {
+      const editable = await amountField.isEditable().catch(() => false);
+      if (editable) {
+        await amountField.fill(String(amount.toFixed(2)));
+        await randomDelay(300, 200);
+      }
+    }
+
+    const continueBtn = page.getByRole('button', {
+      name: /^(continue|next|review|review payment|submit payment|pay \$?[\d.,]+)$/i,
+    }).first();
+    if (await continueBtn.isVisible({ timeout: 6_000 }).catch(() => false)) {
+      await continueBtn.click();
+      await page.waitForTimeout(2000);
+    }
+
+    const confirmBtn = page.getByRole('button', {
+      name: /^(confirm|submit|submit payment|authorize|pay now|make payment)$/i,
+    }).first();
+    if (!(await confirmBtn.isVisible({ timeout: 6_000 }).catch(() => false))) {
+      await screenshot(page, `bge_no_confirm_button_${accountNumber}`);
+      return { ok: false, confirmationRef: null, error: 'Payment confirm button not found' };
+    }
+    await confirmBtn.click();
+    await page.waitForTimeout(3000);
+
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    const confMatch = bodyText.match(/confirmation\s*(?:number|#|no\.?|code)?[:\s]+([A-Z0-9-]{4,})/i);
+    const succeeded = /payment.*(?:successful|received|submitted|scheduled|complete)|thank you/i.test(bodyText) || !!confMatch;
+    await screenshot(page, `bge_payment_${succeeded ? 'success' : 'unconfirmed'}_${accountNumber}`);
+
+    if (!succeeded) return { ok: false, confirmationRef: null, error: 'No success/confirmation indicator after submit' };
+    return { ok: true, confirmationRef: confMatch ? confMatch[1] : null };
+  } catch (err: any) {
+    await screenshot(page, `bge_payment_error_${accountNumber}`);
+    return { ok: false, confirmationRef: null, error: err?.message ?? String(err) };
+  }
+}
 
 /**
  * Navigates to a specific BGE account via the ChangeAccount.aspx picker:

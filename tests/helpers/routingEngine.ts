@@ -50,6 +50,7 @@
  */
 import { PropertyRoutingInput, ConsumptionBaseline, WS2Payload } from './propertySources';
 import { buildDecisionSummary, buildLettersAndWorkOrders, computeBaseline } from './routingTrail';
+import { prorate, ProrationResult } from './prorationEngine';
 
 export type Utility = 'bge' | 'water';
 export type Decision = 'PAY' | 'SKIP' | 'EXCEPTION';
@@ -102,6 +103,14 @@ export interface DecisionStep {
   outcome: string;    // the branch taken, e.g. "tenant pays → SKIP"
 }
 
+/** How to round a computed tenant share (June 19: Jack is comfortable eating a few
+ *  dollars; Aditya wants to avoid systematically over-charging). */
+export type RoundingBias = 'tenant_favor' | 'dominion_favor' | 'nearest';
+/** Proration method. June 19: Baltimore water / BGE bills are a single monthly
+ *  meter read — no daily/weekly breakdown — so Method C (area-under-curve) is
+ *  ruled out. Only 'average' (Method A) is supported. */
+export type ProrationMethod = 'average';
+
 export interface RoutingConfig {
   /** Max water units a vacant unit may consume per period before it's flagged. */
   vacantMaxUsage: number;
@@ -118,6 +127,18 @@ export interface RoutingConfig {
   // Backward-compat aliases (older callers/tests): moderate↔letter, severe↔workOrder.
   moderateSpikeMultiplier: number;
   severeSpikeMultiplier: number;
+  // ── June 19 2026 proration knobs (Method A; see prorationEngine.ts) ──
+  /** Move date within this many days of a bill boundary → attribute the whole
+   *  stub, no proration. June 19: 2–3 days, 3 inclusive. */
+  graceDays: number;
+  /** Only 'average' (Method A) — Method C ruled out June 19. */
+  prorationMethod: ProrationMethod;
+  /** Strip renovation-window usage from the tenant's share before splitting. */
+  renovationExcludesTenant: boolean;
+  /** Tenant share above this $ amount surfaces for human review (June 19: $10). */
+  reviewThresholdDollars: number;
+  /** Which way to round the computed tenant share. */
+  roundingBias: RoundingBias;
 }
 
 export const DEFAULT_CONFIG: RoutingConfig = {
@@ -129,6 +150,11 @@ export const DEFAULT_CONFIG: RoutingConfig = {
   childQuarterlyUnits: 5,
   moderateSpikeMultiplier: 1.5,
   severeSpikeMultiplier: 3,
+  graceDays: 3,                   // June 19: 2–3 days, 3 inclusive
+  prorationMethod: 'average',     // June 19: Method C ruled out (monthly meter read only)
+  renovationExcludesTenant: true,
+  reviewThresholdDollars: 10,     // June 19: "make it 10 bucks"
+  roundingBias: 'tenant_favor',
 };
 
 /** Threshold overrides via env (WS2_VACANT_MAX_USAGE etc.). */
@@ -137,8 +163,21 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RoutingConf
     const n = Number(v);
     return v !== undefined && Number.isFinite(n) && n > 0 ? n : fallback;
   };
+  // reviewThresholdDollars may legitimately be 0 (pay everything to humans), so it
+  // uses a 0-inclusive parse rather than the >0 guard above.
+  const numNonNeg = (v: string | undefined, fallback: number) => {
+    const n = Number(v);
+    return v !== undefined && Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  const bool = (v: string | undefined, fallback: boolean) =>
+    v === undefined ? fallback : /^(1|true|yes|on)$/i.test(v.trim());
   const letter = num(env.WS2_LETTER_MULTIPLIER ?? env.WS2_MODERATE_SPIKE_MULTIPLIER, DEFAULT_CONFIG.letterMultiplier);
   const workOrder = num(env.WS2_WORK_ORDER_MULTIPLIER ?? env.WS2_SEVERE_SPIKE_MULTIPLIER, DEFAULT_CONFIG.workOrderMultiplier);
+  const bias = (env.WS2_ROUNDING_BIAS ?? '').trim().toLowerCase();
+  const roundingBias: RoundingBias =
+    bias === 'dominion_favor' || bias === 'nearest' || bias === 'tenant_favor'
+      ? (bias as RoundingBias)
+      : DEFAULT_CONFIG.roundingBias;
   return {
     vacantMaxUsage: num(env.WS2_VACANT_MAX_USAGE, DEFAULT_CONFIG.vacantMaxUsage),
     renovationVacantMaxUsage: num(env.WS2_RENOVATION_VACANT_MAX_USAGE, DEFAULT_CONFIG.renovationVacantMaxUsage),
@@ -148,6 +187,11 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RoutingConf
     childQuarterlyUnits: num(env.WS2_CHILD_QUARTERLY_UNITS, DEFAULT_CONFIG.childQuarterlyUnits),
     moderateSpikeMultiplier: letter,
     severeSpikeMultiplier: workOrder,
+    graceDays: num(env.WS2_GRACE_DAYS, DEFAULT_CONFIG.graceDays),
+    prorationMethod: 'average', // Method C removed; env cannot re-enable it
+    renovationExcludesTenant: bool(env.WS2_RENOVATION_EXCLUDES_TENANT, DEFAULT_CONFIG.renovationExcludesTenant),
+    reviewThresholdDollars: numNonNeg(env.WS2_REVIEW_THRESHOLD_DOLLARS, DEFAULT_CONFIG.reviewThresholdDollars),
+    roundingBias,
   };
 }
 
@@ -211,6 +255,11 @@ export interface PropertyRoutingResult {
   /** 4–5 line plain-English shorthand of why the verdicts were reached (WS-7 trust). */
   decision_summary: string;
   buckets: Bucket[];
+  /** Mid-cycle move-in/out water split (Method A), when the bill period + occupancy
+   *  timeline are present on the input. Undefined for retrieval-only / week-1 runs.
+   *  The computed number is a suggestion — a human override (proration_override)
+   *  always wins. See prorationEngine.ts. */
+  proration?: ProrationResult;
 }
 
 export interface RoutingRunResult {
@@ -382,6 +431,30 @@ export function detectAnomalies(
   return out;
 }
 
+/** Mid-cycle water proration (Method A). Runs only when WS-4 has supplied the
+ *  bill period + a period total AND an occupancy timeline with a move date is
+ *  present. Water-only: water is always Dominion-paid then billed back (the lien),
+ *  so the split is the thing that needs computing. BGE settles by name change. */
+function computeProration(p: PropertyRoutingInput, cfg: RoutingConfig): ProrationResult | undefined {
+  const period = p.bill_period;
+  const timeline = p.occupancy_timeline;
+  const total = p.period_total_consumption;
+  if (!period || !timeline || total == null) return undefined;
+  if (!timeline.move_in && !timeline.move_out) return undefined; // no mid-cycle event
+  try {
+    return prorate({
+      utility: 'water',
+      bill_period: { start: period.start, end: period.end },
+      occupancy: timeline,
+      total_consumption: total,
+      bill_amount: p.period_bill_amount ?? null,
+      config: cfg,
+    });
+  } catch {
+    return undefined; // bad dates — never block routing on a proration failure
+  }
+}
+
 // ─── Property + run entry points ────────────────────────────────────────────────
 
 export function routeProperty(
@@ -421,6 +494,7 @@ export function routeProperty(
     property_id: p.property_id, property_name: p.property_name,
     decisions, anomalies, letters, work_orders, occupancy_check_required,
     decision_summary: '', buckets,
+    proration: computeProration(p, cfg),
   };
   result.decision_summary = buildDecisionSummary(result, p);
   return result;

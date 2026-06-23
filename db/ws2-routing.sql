@@ -102,3 +102,45 @@ CREATE TABLE IF NOT EXISTS routing_feedback (
   submitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_routing_feedback_run ON routing_feedback(run_id, property_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 5. Mid-cycle move-in / move-out proration (June 19 2026 — Method A only).
+--    Baltimore water is a lien: Dominion always pays then bills the tenant back
+--    for their share of a bill that spans the move date. proration_result holds
+--    the system's COMPUTED split (a suggestion); proration_override holds a
+--    human's final number with who/why (the computed value is always preserved).
+--    Method C (area-under-curve) was ruled out on the call — bills are a single
+--    monthly meter read. Re-running WS-2 for a run_id replaces that run's rows.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS proration_result (
+  id                  SERIAL PRIMARY KEY,
+  run_id              TEXT NOT NULL,
+  property_id         INTEGER NOT NULL,
+  unit_id             INTEGER,
+  utility             TEXT NOT NULL,              -- 'water' (BGE settles by name change)
+  method_used         TEXT NOT NULL,             -- 'average' | 'grace_whole' | 'bge_name_change' | 'bge_exception' | 'no_split'
+  days_period         INTEGER,
+  days_tenant         INTEGER,
+  tenant_share        NUMERIC,                   -- consumption units
+  dominion_share      NUMERIC,
+  computed_amount     NUMERIC,                   -- tenant $ share (null until bill amount known)
+  dominion_amount     NUMERIC,
+  renovation_excluded BOOLEAN NOT NULL DEFAULT FALSE,
+  needs_review        BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_proration_result_run    ON proration_result(run_id);
+CREATE INDEX IF NOT EXISTS idx_proration_result_review ON proration_result(run_id, needs_review);
+
+CREATE TABLE IF NOT EXISTS proration_override (
+  id              SERIAL PRIMARY KEY,
+  run_id          TEXT NOT NULL,
+  property_id     INTEGER NOT NULL,
+  unit_id         INTEGER,
+  computed_amount NUMERIC,                        -- what the system suggested
+  final_amount    NUMERIC NOT NULL,              -- what the human entered
+  changed_by      TEXT NOT NULL,                 -- who (name)
+  reason          TEXT,                          -- why
+  changed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_proration_override_run ON proration_override(run_id, property_id);

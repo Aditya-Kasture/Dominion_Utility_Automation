@@ -4,6 +4,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { Pool, PoolClient } from 'pg';
 
 const WATER_CACHE_FILE = path.resolve(__dirname, '..', '..', 'cache', 'water-accounts.json');
@@ -232,6 +233,9 @@ export async function logWaterRun(params: {
   due_date?: string | null;
   threshold_action?: string | null;
   notes?: string | null;
+  // June 19: bill window for WS-2 proration (columns added in db/migrations.sql).
+  period_start?: string | null;
+  period_end?: string | null;
 }): Promise<void> {
   if (dbOffline) {
     appendOfflineLog(WATER_OFFLINE_LOG, params);
@@ -243,13 +247,15 @@ export async function logWaterRun(params: {
     await client.query(
       `INSERT INTO public.water_portal_audit_log
          (unit_id, property_id, action, status, bill_amount,
-          consumption_units, due_date, threshold_action, notes, run_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+          consumption_units, due_date, threshold_action, notes,
+          period_start, period_end, run_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
        ON CONFLICT DO NOTHING`,
       [
         params.unit_id, params.property_id, params.action, params.status,
         params.bill_amount ?? null, params.consumption_units ?? null,
         params.due_date ?? null, params.threshold_action ?? null, params.notes ?? null,
+        params.period_start ?? null, params.period_end ?? null,
       ]
     );
   } catch (err: any) {
@@ -262,6 +268,115 @@ export async function logWaterRun(params: {
       return;
     }
     throw err;
+  } finally {
+    client?.release();
+  }
+}
+
+// ─── WS-3 / WS-4 payment execution (approval-gated + idempotent) ────────────────
+// Payment never fires without an explicit payment_approval row (June 19 2026).
+// recordPaymentAttempt() is keyed by an idempotency_key so a re-run can never
+// double-pay. See db/ws3-ws4-payments.sql.
+
+export type PaymentUtility = 'bge' | 'water';
+
+export interface PaymentApproval {
+  property_id: number | null;
+  utility: PaymentUtility;
+  account_number: string;
+  approved_amount: number | null;
+  approved_by: string;
+}
+
+export type PaymentStatus =
+  | 'PENDING' | 'SUBMITTED' | 'CONFIRMED' | 'FAILED' | 'SKIPPED_NO_APPROVAL';
+
+/** Deterministic idempotency key for a payment — a second submit with the same
+ *  run/utility/account/amount collides and is rejected by the UNIQUE index. */
+export function paymentIdempotencyKey(
+  run_id: string, utility: PaymentUtility, account_number: string, amount: number | null
+): string {
+  return crypto.createHash('sha256')
+    .update(`${run_id}|${utility}|${account_number}|${amount ?? ''}`)
+    .digest('hex');
+}
+
+/** Approvals for a run+utility, keyed by account_number. Empty map (no approvals)
+ *  is the safe default — the agent then SKIPs every account. */
+export async function fetchPaymentApprovals(
+  run_id: string, utility: PaymentUtility
+): Promise<Map<string, PaymentApproval>> {
+  const out = new Map<string, PaymentApproval>();
+  let client: PoolClient | null = null;
+  try {
+    client = await getPool().connect();
+    const { rows } = await client.query<PaymentApproval>(
+      `SELECT property_id, utility, account_number, approved_amount, approved_by
+         FROM public.payment_approval
+        WHERE run_id = $1 AND utility = $2`,
+      [run_id, utility]
+    );
+    for (const r of rows) out.set(String(r.account_number), { ...r, approved_amount: r.approved_amount == null ? null : Number(r.approved_amount) });
+  } catch (err: any) {
+    console.warn(`[DB] Could not load payment approvals (${err?.message ?? err}) — treating as NO approvals (all skipped).`);
+  } finally {
+    client?.release();
+  }
+  return out;
+}
+
+/** True if this exact payment has already been CONFIRMED (idempotent re-run guard). */
+export async function isPaymentConfirmed(idempotency_key: string): Promise<boolean> {
+  let client: PoolClient | null = null;
+  try {
+    client = await getPool().connect();
+    const { rows } = await client.query<{ status: string }>(
+      `SELECT status FROM public.payment_attempt WHERE idempotency_key = $1`,
+      [idempotency_key]
+    );
+    return rows.some(r => r.status === 'CONFIRMED');
+  } catch {
+    return false;
+  } finally {
+    client?.release();
+  }
+}
+
+/** Insert/advance a payment attempt. UNIQUE(idempotency_key) makes a duplicate
+ *  submit a no-op; status transitions are recorded via updated_at on conflict for
+ *  the SAME key only when moving a PENDING/SUBMITTED row to a terminal state. */
+export async function recordPaymentAttempt(params: {
+  run_id: string;
+  property_id: number | null;
+  unit_id?: number | null;
+  utility: PaymentUtility;
+  account_number: string;
+  amount: number | null;
+  status: PaymentStatus;
+  confirmation_ref?: string | null;
+  error?: string | null;
+}): Promise<void> {
+  const key = paymentIdempotencyKey(params.run_id, params.utility, params.account_number, params.amount);
+  let client: PoolClient | null = null;
+  try {
+    client = await getPool().connect();
+    await client.query(
+      `INSERT INTO public.payment_attempt
+         (run_id, property_id, unit_id, utility, account_number, idempotency_key,
+          amount, status, confirmation_ref, error, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),NOW())
+       ON CONFLICT (idempotency_key) DO UPDATE
+         SET status           = EXCLUDED.status,
+             confirmation_ref = COALESCE(EXCLUDED.confirmation_ref, public.payment_attempt.confirmation_ref),
+             error            = EXCLUDED.error,
+             updated_at       = NOW()
+         WHERE public.payment_attempt.status NOT IN ('CONFIRMED')`,
+      [params.run_id, params.property_id, params.unit_id ?? null, params.utility,
+       params.account_number, key, params.amount, params.status,
+       params.confirmation_ref ?? null, params.error ?? null]
+    );
+  } catch (err: any) {
+    console.error(`[DB] Failed to record payment_attempt for ${params.account_number}: ${err?.message ?? err}`);
   } finally {
     client?.release();
   }

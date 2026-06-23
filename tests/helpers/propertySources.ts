@@ -76,6 +76,29 @@ export interface PropertyRoutingInput {
   /** Occupant counts (Podio) for expected-usage = adults×10 + children×5 per qtr. */
   occupant_adults?: number | null;
   occupant_children?: number | null;
+  // ── June 19 2026 proration inputs (optional/nullable until upstream wired) ──
+  /** Bill window for the current period — scraped by WS-4 (water) / WS-3 (BGE).
+   *  Required for proration; absent in week-1 / retrieval-only runs. */
+  bill_period?: ProrationBillPeriod | null;
+  /** Tenant move-in/out + renovation window overlapping the bill period.
+   *  Sourced from Postgres once Abdul confirms the columns (data-spike). */
+  occupancy_timeline?: OccupancyTimeline | null;
+  /** Single period total water consumption (Method A only — no daily breakdown). */
+  period_total_consumption?: number | null;
+  /** Current period bill dollar amount, when known (enables the $ split + review). */
+  period_bill_amount?: number | null;
+}
+
+export interface ProrationBillPeriod {
+  start: string;  // YYYY-MM-DD or ISO
+  end: string;
+}
+
+export interface OccupancyTimeline {
+  move_in?: string | null;
+  move_out?: string | null;
+  renovation?: { start: string; end: string } | null;
+  bge_name_change_near_move?: boolean | null;
 }
 
 export interface WS2Payload {

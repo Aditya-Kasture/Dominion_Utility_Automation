@@ -200,7 +200,14 @@ interface GraphOtpConfig {
   sender?: string;
 }
 
-export async function fetchBGEOtpFromGraph(config: GraphOtpConfig = {}): Promise<string | null> {
+/**
+ * Generic Graph OTP reader. BGE and Water both deliver their verification codes
+ * to the same shared Outlook mailbox (construction@thedominiongroup.com) — only
+ * the sender differs — so the only per-portal difference is the `sender` filter.
+ * Callers pass { sender, mailbox } (or set per-portal env vars); the default
+ * mailbox + BGE sender preserve the original BGE behaviour.
+ */
+export async function fetchOtpFromGraph(config: GraphOtpConfig = {}): Promise<string | null> {
   const tenantId     = envFirst('AZURE_TENANT_ID', 'GRAPH_TENANT_ID', 'MS_TENANT_ID', 'TENANT_ID');
   const clientId     = envFirst('AZURE_CLIENT_ID', 'GRAPH_CLIENT_ID', 'MS_CLIENT_ID', 'APPLICATION_ID', 'CLIENT_ID');
   const clientSecret = envFirst('AZURE_CLIENT_SECRET', 'GRAPH_CLIENT_SECRET', 'MS_CLIENT_SECRET', 'SECRET_ID', 'CLIENT_SECRET');
@@ -277,6 +284,25 @@ export async function fetchBGEOtpFromGraph(config: GraphOtpConfig = {}): Promise
     }
   }
 
-  console.error('[OTP/Graph] Timed out waiting for BGE OTP email.');
+  console.error(`[OTP/Graph] Timed out waiting for OTP email from ${sender}.`);
   return null;
+}
+
+/** BGE OTP via Graph — thin wrapper preserving the original signature/defaults. */
+export function fetchBGEOtpFromGraph(config: GraphOtpConfig = {}): Promise<string | null> {
+  return fetchOtpFromGraph({
+    ...config,
+    mailbox: config.mailbox ?? process.env.BGE_OTP_MAILBOX ?? 'construction@thedominiongroup.com',
+    sender: config.sender ?? process.env.BGE_OTP_SENDER ?? 'no-reply@bge.com',
+  });
+}
+
+/** Baltimore Water OTP via Graph — same shared mailbox, different sender.
+ *  Override sender/mailbox via WATER_OTP_SENDER / WATER_OTP_MAILBOX. */
+export function fetchWaterOtpFromGraph(config: GraphOtpConfig = {}): Promise<string | null> {
+  return fetchOtpFromGraph({
+    ...config,
+    mailbox: config.mailbox ?? process.env.WATER_OTP_MAILBOX ?? process.env.BGE_OTP_MAILBOX ?? 'construction@thedominiongroup.com',
+    sender: config.sender ?? process.env.WATER_OTP_SENDER ?? 'no-reply@baltimorecity.gov',
+  });
 }

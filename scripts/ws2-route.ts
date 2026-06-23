@@ -88,6 +88,7 @@ async function persistDecisions(run: RoutingRunResult): Promise<void> {
     await client.query('DELETE FROM public.consumption_anomaly WHERE run_id = $1', [run.run_id]);
     await client.query('DELETE FROM public.tenant_letter WHERE run_id = $1', [run.run_id]);
     await client.query('DELETE FROM public.work_order_request WHERE run_id = $1', [run.run_id]);
+    await client.query('DELETE FROM public.proration_result WHERE run_id = $1', [run.run_id]);
 
     for (const r of run.results) {
       for (const d of r.decisions) {
@@ -122,6 +123,19 @@ async function persistDecisions(run: RoutingRunResult): Promise<void> {
              (run_id, property_id, unit_id, utility_type, reading, expected, reason)
            VALUES ($1,$2,$3,$4,$5,$6,$7)`,
           [run.run_id, w.property_id, w.unit_id, w.utility_type, w.reading, w.expected, w.reason]
+        );
+      }
+      if (r.proration) {
+        const pr = r.proration;
+        await client.query(
+          `INSERT INTO public.proration_result
+             (run_id, property_id, unit_id, utility, method_used, days_period, days_tenant,
+              tenant_share, dominion_share, computed_amount, dominion_amount,
+              renovation_excluded, needs_review)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+          [run.run_id, r.property_id, null, pr.utility, pr.method_used, pr.days_period, pr.days_tenant,
+           pr.tenant_share, pr.dominion_share, pr.tenant_amount, pr.dominion_amount,
+           pr.renovation_excluded, pr.needs_review]
         );
       }
     }
