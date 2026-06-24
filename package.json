@@ -31,6 +31,7 @@
     "import:water-mapping": "tsx scripts/import-water-mapping.ts",
     "import:water-xlsx": "tsx scripts/import-water-from-xlsx.ts",
     "cache:water": "tsx scripts/cache-water-accounts.ts",
+    "db:migrate": "tsx scripts/db-migrate.ts",
     "db:diagnose": "tsx scripts/db-diagnose.ts",
     "db:fix-water-fk": "tsx scripts/fix-water-fk.ts",
     "match:water-gemini": "tsx scripts/match-water-with-gemini.ts",
