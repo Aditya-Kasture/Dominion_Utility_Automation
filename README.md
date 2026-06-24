@@ -13,7 +13,7 @@ retrieves BGE and Baltimore Water bills, and executes **approval-gated** payment
 | WS-3 | BGE portal agent — login (OTP), bill retrieval, **approval-gated payment** | `tests/bge.spec.ts` |
 | WS-4 | Baltimore Water agent — login (OTP), bill + period + consumption, **approval-gated payment** | `tests/water.spec.ts` |
 | WS-5 | Postgres reconciliation (account↔property mapping) | `scripts/import-*-mapping.ts` |
-| WS-6 | Audit log + Outlook alerting | `tests/helpers/outlookAlert.ts` |
+| WS-6 | Audit log middleware, weekly `run_summary` + Outlook digest, feedback hook | `scripts/ws6-summary.ts`, `scripts/ws6-feedback.ts`, `tests/helpers/outlookAlert.ts` |
 
 Decision rules and the June 12 / June 19 client-call decisions are documented in
 [`docs/`](docs/).
@@ -26,15 +26,22 @@ npx playwright install chromium
 cp .env.example .env        # then fill in DB + portal creds + Azure Graph
 ```
 
-Create the database schema (once, against Postgres):
+Create the database schema (once). The runner applies every `db/*.sql` in
+dependency order using your `.env` connection (idempotent — safe to re-run):
 
 ```bash
-psql "$CONN" -f db/base-schema.sql \
-             -f db/migrations.sql \
-             -f db/ws1-orchestration.sql \
-             -f db/ws2-routing.sql \
-             -f db/ws3-ws4-payments.sql
+npm run db:migrate
 ```
+
+> Creates the orchestration/WS tables (`orchestration_run`, `routing_decision`,
+> `payment_*`, `run_summary`, the portal audit logs, and the empty
+> `bge_account_property_map` / `water_account_map`) in `public`.
+
+**Data prerequisites** for a non-empty BGE/Water run (separate from the schema):
+the source `hub.*` tables (`property`, `unit`, responsibility, baselines) must be
+populated, and the account-mapping tables filled via
+`npm run import:bge-mapping` / `npm run import:water-mapping`. Pointing at a DB
+that already has this data needs no extra step. Check with `npm run db:diagnose`.
 
 ## Running
 
@@ -43,12 +50,14 @@ psql "$CONN" -f db/base-schema.sql \
 npm run typecheck
 npm run ws2:test            # routing unit tests
 npm run ws2:proration-test  # proration unit tests
+npm run ws6:test            # WS-6 digest unit tests
 
 # Pipeline:
 npm run ws1:run             # build the WS-2 payload from Postgres
 npm run ws2:route           # route + prorate + persist decisions
 npm run bge:bills           # retrieve BGE bills
 npm run water:full          # water login (OTP) + retrieve bills
+npm run ws6:summary         # roll up the run + send the Outlook digest
 
 # Payment (approval-gated — see below):
 npm run approve:payment -- --run <run_id> --utility water --account <n> --amount <$> --by "Name"
