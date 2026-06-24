@@ -14,6 +14,7 @@
  * must never take down the weekly run.
  */
 import { ConsumptionAnomaly, RoutingRunResult } from './routingEngine';
+import { RunSummary } from './runSummary';
 
 export interface OutlookAlert {
   subject: string;
@@ -95,6 +96,44 @@ export function buildWs2Alert(run: RoutingRunResult): OutlookAlert | null {
     severity: severe.length ? 'critical' : 'warning',
     source: 'WS-2 routing',
     run_id: run.run_id,
+    body: lines.join('\n'),
+  };
+}
+
+/** WS-6 weekly digest — the "what we did this week" rollup, built from the
+ *  run_summary row. Always returns an alert (the digest is sent every run, even
+ *  a clean one). Severity escalates on failed payments / severe anomalies. */
+export function buildRunDigest(s: RunSummary): OutlookAlert {
+  const severity: OutlookAlert['severity'] =
+    (s.severe_anomalies > 0 || s.payments_failed > 0) ? 'critical'
+    : (s.exception_count > 0 || s.occupancy_checks > 0) ? 'warning'
+    : 'info';
+
+  const money = (n: number) => `$${n.toFixed(2)}`;
+  const lines: string[] = [
+    `Routing — BGE-pay: ${s.bge_pay}, Water-pay: ${s.water_pay}, ` +
+      `Tenant-skip: ${s.tenant_skip}, Exceptions: ${s.exception_count}.`,
+    `Accounts routed — BGE: ${s.bge_accounts_seen}, Water: ${s.water_accounts_seen}.`,
+    '',
+    `Payments — ${s.payments_confirmed} confirmed (${money(s.amount_paid_total)}), ` +
+      `${s.payments_failed} failed, ${s.payments_skipped} skipped (no approval).`,
+    '',
+    `Consumption — ${s.severe_anomalies} severe, ${s.moderate_anomalies} moderate ` +
+      `anomalies. WS-7 staged: ${s.letters} letter(s), ${s.work_orders} work order(s).`,
+    `Proration — ${s.prorations_needing_review} split(s) need human review.`,
+  ];
+  if (s.occupancy_checks > 0) {
+    lines.push('', `${s.occupancy_checks} occupancy check(s) required ` +
+      `(BGE reverted to landlord on an occupied unit).`);
+  }
+
+  return {
+    subject: `Dominion weekly summary ${s.run_id}: ` +
+      `${s.payments_confirmed} paid (${money(s.amount_paid_total)}), ` +
+      `${s.exception_count} exceptions, ${s.severe_anomalies} severe anomalies`,
+    severity,
+    source: 'WS-6 summary',
+    run_id: s.run_id,
     body: lines.join('\n'),
   };
 }

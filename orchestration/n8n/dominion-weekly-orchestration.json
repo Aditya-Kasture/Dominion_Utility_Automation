@@ -88,6 +88,16 @@
     },
     {
       "parameters": {
+        "command": "cd \"{{ $env.DOMINION_PROJECT_DIR }}\" && npx tsx scripts/ws6-summary.ts"
+      },
+      "name": "WS-6 Summary",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1500, 120],
+      "notes": "Runs at the tail of the cycle (after WS-3/WS-4). Resolves the run_id from cache/ws2-latest.json, upserts run_summary, writes cache/ws6-summary-<run_id>.json, and sends the weekly Outlook digest. exit 0=SUCCESS, 1=FAILED."
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "={{ $env.OUTLOOK_WEBHOOK_URL }}",
         "sendBody": true,
@@ -131,6 +141,9 @@
         [{ "node": "Continue to WS-3/WS-4", "type": "main", "index": 0 }],
         [{ "node": "WS-6 Outlook Alert", "type": "main", "index": 0 }]
       ]
+    },
+    "Continue to WS-3/WS-4": {
+      "main": [[{ "node": "WS-6 Summary", "type": "main", "index": 0 }]]
     },
     "WS-6 Outlook Alert": {
       "main": [[{ "node": "Halt Run", "type": "main", "index": 0 }]]

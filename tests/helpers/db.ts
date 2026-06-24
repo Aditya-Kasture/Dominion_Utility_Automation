@@ -16,6 +16,11 @@ const BGE_OFFLINE_LOG   = path.join(OFFLINE_LOG_DIR, 'bge-run-offline.jsonl');
 // DB_OFFLINE=1), log writes go to a JSONL file in /cache instead of Postgres.
 let dbOffline = process.env.DB_OFFLINE === '1' || process.env.DB_OFFLINE === 'true';
 
+// WS-6 "Supabase-ready" seam: every audit/feedback write qualifies its table with
+// this schema, so moving WS-6 to Supabase (June 19 decision) is a config swap
+// (WS6_SCHEMA=...) rather than a code change. Defaults to the current Postgres home.
+const AUDIT_SCHEMA = process.env.WS6_SCHEMA ?? 'public';
+
 function isDbUnavailableError(err: any): boolean {
   const code = err?.code ?? '';
   return ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN'].includes(code);
@@ -175,46 +180,89 @@ export async function fetchWaterAccounts(): Promise<WaterAccount[]> {
   }
 }
 
-export async function logBGERun(params: {
-  bge_account_number: string;
+// ─── WS-6 audit-log middleware ──────────────────────────────────────────────
+// One source-agnostic writer for every portal action, replacing the two
+// near-identical loggers that used to live here. Routes to the correct physical
+// table by `entity`, preserves the offline-JSONL fallback, and qualifies the
+// table with AUDIT_SCHEMA (the Supabase-ready seam). logBGERun / logWaterRun are
+// kept as thin wrappers so existing WS-3/WS-4 call sites need no change.
+
+export type AuditEntity = 'bge' | 'water';
+export type AuditSource = 'WS-1' | 'WS-2' | 'WS-3' | 'WS-4' | 'WS-6';
+
+export interface AuditEvent {
+  source: AuditSource;
+  entity: AuditEntity;          // selects the physical portal-log table
   property_id: number | null;
   action: string;
   status: string;
+  // bge identity
+  bge_account_number?: string;
+  // water identity
+  unit_id?: number;
+  // shared payload
   bill_amount?: number | null;
   due_date?: string | null;
   notes?: string | null;
-}): Promise<void> {
-  // Audit log requires NOT NULL property_id. If the BGE account doesn't link
-  // to a hub.property row, we skip the DB log but still leave the data on
-  // disk via the screenshot trail.
-  if (params.property_id == null) {
-    console.warn(`[BGE] Skipping audit-log write for ${params.bge_account_number} — no property_id (unmatched to hub.property).`);
+  // water-only payload
+  consumption_units?: number | null;
+  threshold_action?: string | null;
+  // June 19: bill window for WS-2 proration (columns added in db/migrations.sql).
+  period_start?: string | null;
+  period_end?: string | null;
+}
+
+export async function logAuditEvent(e: AuditEvent): Promise<void> {
+  const offlineFile = e.entity === 'bge' ? BGE_OFFLINE_LOG : WATER_OFFLINE_LOG;
+
+  // BGE audit log requires NOT NULL property_id. If the account doesn't link to
+  // a hub.property row, skip the DB log (the screenshot trail still has it).
+  if (e.entity === 'bge' && e.property_id == null) {
+    console.warn(`[BGE] Skipping audit-log write for ${e.bge_account_number} — no property_id (unmatched to hub.property).`);
     return;
   }
   if (dbOffline) {
-    appendOfflineLog(BGE_OFFLINE_LOG, params);
+    appendOfflineLog(offlineFile, e);
     return;
   }
+
   let client: PoolClient | null = null;
   try {
     client = await getPool().connect();
-    await client.query(
-      `INSERT INTO public.bge_portal_audit_log
-         (bge_account_number, property_id, action, status, bill_amount, due_date, notes, run_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-       ON CONFLICT DO NOTHING`,
-      [
-        params.bge_account_number, params.property_id, params.action, params.status,
-        params.bill_amount ?? null, params.due_date ?? null, params.notes ?? null,
-      ]
-    );
+    if (e.entity === 'bge') {
+      await client.query(
+        `INSERT INTO ${AUDIT_SCHEMA}.bge_portal_audit_log
+           (bge_account_number, property_id, action, status, bill_amount, due_date, notes, run_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT DO NOTHING`,
+        [
+          e.bge_account_number, e.property_id, e.action, e.status,
+          e.bill_amount ?? null, e.due_date ?? null, e.notes ?? null,
+        ]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO ${AUDIT_SCHEMA}.water_portal_audit_log
+           (unit_id, property_id, action, status, bill_amount,
+            consumption_units, due_date, threshold_action, notes,
+            period_start, period_end, run_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+         ON CONFLICT DO NOTHING`,
+        [
+          e.unit_id, e.property_id, e.action, e.status,
+          e.bill_amount ?? null, e.consumption_units ?? null,
+          e.due_date ?? null, e.threshold_action ?? null, e.notes ?? null,
+          e.period_start ?? null, e.period_end ?? null,
+        ]
+      );
+    }
   } catch (err: any) {
     if (isDbUnavailableError(err)) {
       if (!dbOffline) {
         dbOffline = true;
-        console.warn(`[DB] Connection lost (${err.code}). Switching to OFFLINE mode — subsequent log writes go to ${BGE_OFFLINE_LOG}`);
+        console.warn(`[DB] Connection lost (${err.code}). Switching to OFFLINE mode — subsequent log writes go to ${offlineFile}`);
       }
-      appendOfflineLog(BGE_OFFLINE_LOG, params);
+      appendOfflineLog(offlineFile, e);
       return;
     }
     throw err;
@@ -223,7 +271,21 @@ export async function logBGERun(params: {
   }
 }
 
-export async function logWaterRun(params: {
+/** WS-3 BGE portal action → audit log. Thin wrapper over logAuditEvent. */
+export function logBGERun(params: {
+  bge_account_number: string;
+  property_id: number | null;
+  action: string;
+  status: string;
+  bill_amount?: number | null;
+  due_date?: string | null;
+  notes?: string | null;
+}): Promise<void> {
+  return logAuditEvent({ source: 'WS-3', entity: 'bge', ...params });
+}
+
+/** WS-4 Water portal action → audit log. Thin wrapper over logAuditEvent. */
+export function logWaterRun(params: {
   unit_id: number;
   property_id: number;
   action: string;
@@ -233,41 +295,32 @@ export async function logWaterRun(params: {
   due_date?: string | null;
   threshold_action?: string | null;
   notes?: string | null;
-  // June 19: bill window for WS-2 proration (columns added in db/migrations.sql).
   period_start?: string | null;
   period_end?: string | null;
 }): Promise<void> {
-  if (dbOffline) {
-    appendOfflineLog(WATER_OFFLINE_LOG, params);
-    return;
-  }
+  return logAuditEvent({ source: 'WS-4', entity: 'water', ...params });
+}
+
+/** WS-6 feedback hook — records a user's disagreement with a routing verdict.
+ *  Writes the existing routing_feedback table (db/ws2-routing.sql). The WS-7
+ *  report UI can call this same function once it exists. */
+export async function recordRoutingFeedback(params: {
+  run_id: string;
+  property_id: number;
+  utility?: string | null;       // 'bge' | 'water' | null (whole property)
+  feedback_text: string;
+  submitted_by?: string | null;
+}): Promise<void> {
   let client: PoolClient | null = null;
   try {
     client = await getPool().connect();
     await client.query(
-      `INSERT INTO public.water_portal_audit_log
-         (unit_id, property_id, action, status, bill_amount,
-          consumption_units, due_date, threshold_action, notes,
-          period_start, period_end, run_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-       ON CONFLICT DO NOTHING`,
-      [
-        params.unit_id, params.property_id, params.action, params.status,
-        params.bill_amount ?? null, params.consumption_units ?? null,
-        params.due_date ?? null, params.threshold_action ?? null, params.notes ?? null,
-        params.period_start ?? null, params.period_end ?? null,
-      ]
+      `INSERT INTO ${AUDIT_SCHEMA}.routing_feedback
+         (run_id, property_id, utility, feedback_text, submitted_by)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [params.run_id, params.property_id, params.utility ?? null,
+       params.feedback_text, params.submitted_by ?? null]
     );
-  } catch (err: any) {
-    if (isDbUnavailableError(err)) {
-      if (!dbOffline) {
-        dbOffline = true;
-        console.warn(`[DB] Connection lost (${err.code}). Switching to OFFLINE mode — subsequent log writes go to ${WATER_OFFLINE_LOG}`);
-      }
-      appendOfflineLog(WATER_OFFLINE_LOG, params);
-      return;
-    }
-    throw err;
   } finally {
     client?.release();
   }

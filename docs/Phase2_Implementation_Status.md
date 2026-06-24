@@ -34,7 +34,7 @@ This supersedes the relevant parts of `Dominion_Phase2_Final_Plan_v3.docx` (the 
 | WS-3 | Playwright BGE Agent | 12.0 | ✅ **Done** — retrieval + approval-gated, idempotent payment (`pay` mode) |
 | WS-4 | Playwright Water Agent | 10.0 | ✅ **Done** — retrieval + OTP + approval-gated payment; period dates captured |
 | WS-5 | PostgreSQL Reconciliation Layer | 9.0 | 🟡 **Partial** — mapping tables exist, fuzzy-match layer absent |
-| WS-6 | Audit Log & Alerting | 9.5 | 🟡 **Partial** — **moving to Supabase** (June 19); tables + Outlook alerts done, no middleware/summary |
+| WS-6 | Audit Log & Alerting | 9.5 | ✅ **Done** — audit middleware, weekly `run_summary` + Outlook digest, feedback hook (`routing_feedback`) built; **Supabase migration** still pending (June 19, Yaseen) |
 | WS-7 | Letters, Work Orders & Batch Report | 11.0 | ❌ **Scaffolded only** — logic + tables, no delivery/report/approval |
 | WS-8 | QuickBooks Journal Entry Generator | 7.5 | ❌ **Not started** |
 
@@ -68,9 +68,12 @@ This supersedes the relevant parts of `Dominion_Phase2_Final_Plan_v3.docx` (the 
 - audit / paperless / bills / **pay** modes; OTP via Microsoft Graph (Outlook mailbox); paperless enrollment with Postgres state; bill retrieval; audit-log integration — `tests/bge.spec.ts`
 - **Payment (`pay` mode):** `submitPayment()` runs only for accounts with a `payment_approval` row for the run; idempotent via `payment_attempt.idempotency_key`; logs `payment` action. No approval → `SKIPPED_NO_APPROVAL`.
 
-### WS-6 — Audit & Alerting (partial set)
+### WS-6 — Audit & Alerting
 - `bge_portal_audit_log` + `water_portal_audit_log` tables exist
 - **Outlook** email alerting with batched anomaly/exception context — `tests/helpers/outlookAlert.ts`
+- **Reusable audit-log middleware** — `logAuditEvent` in `tests/helpers/db.ts` (façade `tests/helpers/auditLog.ts`); `logBGERun`/`logWaterRun` are thin wrappers. `WS6_SCHEMA` env seam keeps it Supabase-portable.
+- **Weekly run summary** — `run_summary` table (`db/ws6-audit-summary.sql`) + generator (`tests/helpers/runSummary.ts`, `scripts/ws6-summary.ts`, `npm run ws6:summary`); emits an Outlook **digest** (`buildRunDigest`) each run.
+- **Feedback hook** — `recordRoutingFeedback` writes `routing_feedback`; CLI `scripts/ws6-feedback.ts` (`npm run ws6:feedback`). The WS-7 report UI can call the same function.
 
 ---
 
@@ -79,7 +82,7 @@ This supersedes the relevant parts of `Dominion_Phase2_Final_Plan_v3.docx` (the 
 - **WS-4 Water agent** — login + **OTP (Graph)** + bill retrieval + tiered consumption + **approval-gated payment (`pay` mode)** + bill-period capture (`period_start`/`period_end`) done. Paperless permanently skipped (no portal toggle). PM-alert / work-order dispatch remain **logged-only** by design (June 19) — not auto-dispatched.
 - **WS-5 unified address key** — mapping tables (`bge_account_property_map`, `water_account_map`) exist, but no dedicated unified-key column/index
 - **WS-5 routing checks mapping first** — lookup exists; unmatched rows logged to JSONL but not routed into an exception list
-- **WS-6 feedback hook** — table **exists** (`routing_feedback`, `db/ws2-routing.sql:95`, index at :104) and is referenced by the alert builder; the **UI/endpoint** that writes to it is not yet built
+- **WS-6 feedback hook** — ✅ table (`routing_feedback`) + writer (`recordRoutingFeedback`) + CLI (`scripts/ws6-feedback.ts`) done. A graphical **report UI** that posts feedback is still WS-7 scope, but it can reuse the same writer.
 - **WS-7 work orders** — `work_order_request` table + staging logic exist, no delivery/dispatch
 - **WS-7 decision-trail "flowchart"** — computed + serialized to DB, but **no UI/report rendering**
 
@@ -98,9 +101,11 @@ This supersedes the relevant parts of `Dominion_Phase2_Final_Plan_v3.docx` (the 
 - Unresolved-address surface table
 - Per-run address confidence log
 
-### WS-6 alerting
-- Reusable audit-log **middleware module** (currently ad-hoc `logBGERun`/`logWaterRun` in `tests/helpers/db.ts`)
-- Weekly summary record generator (referenced in alert body, no generator/table)
+### WS-6 alerting — ✅ DONE (this build)
+- ✅ Reusable audit-log **middleware** (`logAuditEvent`, wrappers delegate)
+- ✅ Weekly summary **table + generator + Outlook digest** (`run_summary`, `ws6:summary`)
+- ✅ Feedback writer + CLI (`routing_feedback`, `ws6:feedback`)
+- ⏳ **Supabase migration** still pending (June 19, Yaseen) — code is Supabase-portable via `WS6_SCHEMA`; the move is a connection/schema swap, not a rewrite.
 - *(Slack webhook — superseded by Outlook per June 19; treat as N/A, not a gap)*
 
 ### WS-7 — Letters / Work Orders / Batch Report (biggest gap)
