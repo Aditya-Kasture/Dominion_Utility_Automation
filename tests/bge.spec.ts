@@ -18,14 +18,13 @@ import path from 'path';
 import { test, expect, Page, BrowserContext } from '@playwright/test';
 import * as dotenv from 'dotenv';
 import {
-  logBGERun, closePool, BGEAccount, validateEnv,
+  logBGERun, closePool, BGEAccount, validateEnv, fetchBGEAccounts,
   fetchPaymentApprovals, recordPaymentAttempt, isPaymentConfirmed, paymentIdempotencyKey,
   PaymentApproval,
 } from './helpers/db';
 import { fetchBGEOtp, waitForManualOtp, fetchBGEOtpFromGraph } from './helpers/emailOTP';
 import { hideAutomationSignals, randomDelay, parseDollarAmount, parseDate, screenshot, getRandomUserAgent, detectBotBlock } from './helpers/utils';
 import {
-  loadBGEAddressesFromCsv,
   writeBGEResults,
   BGEAddressRow,
   BGERunResult,
@@ -51,9 +50,6 @@ const IMAP_PORT = Number(process.env.IMAP_PORT ?? 993);
 const IMAP_EMAIL = process.env.IMAP_EMAIL ?? BGE_EMAIL;
 const IMAP_PASSWORD = process.env.IMAP_PASSWORD ?? '';
 
-const INPUT_CSV = path.resolve(
-  process.env.BGE_INPUT_CSV ?? 'cache/all-dominion-addresses.csv'
-);
 const RESULTS_CSV = path.resolve(
   process.env.BGE_RESULTS_CSV ?? 'cache/all-dominion-addresses-results.csv'
 );
@@ -91,14 +87,18 @@ test.beforeAll(async ({ browser }) => {
   page = await context.newPage();
   await hideAutomationSignals(page);
 
-  const loaded = loadBGEAddressesFromCsv(INPUT_CSV);
-  accounts = loaded.accounts;
-  allRows  = loaded.allRows;
-  console.log(
-    `[BGE] Loaded ${accounts.length} BGE accounts across ${allRows.length} addresses ` +
-    `(${loaded.rowsWithoutAccount} addresses skipped — no BGE account #).`
-  );
-  console.log(`[BGE] Input CSV:   ${INPUT_CSV}`);
+  // Source of truth = Postgres (public.bge_account_property_map), via fetchBGEAccounts().
+  accounts = await fetchBGEAccounts();
+  // Mirror the DB accounts into the results-CSV row shape so the per-account
+  // run-results writer (afterAll) still produces its artifact.
+  allRows = accounts.map(a => ({
+    property_address:    a.property_address,
+    bge_account_numbers: a.bge_account_number,
+    entity:              a.property_name ?? '',
+    qb_account_no:       '',
+    sources:             'db:public.bge_account_property_map',
+  }));
+  console.log(`[BGE] Loaded ${accounts.length} BGE accounts from Postgres (public.bge_account_property_map).`);
   console.log(`[BGE] Results CSV: ${RESULTS_CSV}`);
 });
 
