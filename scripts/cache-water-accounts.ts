@@ -49,13 +49,14 @@ async function run() {
         COALESCE(NULLIF(u.state,   ''), p.state)   AS state,
         p.zip,
         p.lifecycle_stage,
-        u.status_code,
+        us.code             AS status_code,
         (SELECT COUNT(*) FROM hub.unit u2 WHERE u2.property_id = p.id) > 1
                             AS is_multi_unit,
         ucb.baseline_amount AS consumption_baseline,
         ucb.period_unit     AS baseline_period
       FROM hub.unit u
       JOIN hub.property p ON u.property_id = p.id
+      LEFT JOIN hub.unit_status us ON us.id = u.unit_status_id
       JOIN hub.unit_utility_responsibility uur
         ON uur.unit_id = u.id
         AND uur.utility_type = 'water'
