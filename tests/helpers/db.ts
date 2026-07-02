@@ -8,9 +8,9 @@ import crypto from 'crypto';
 import { Pool, PoolClient } from 'pg';
 
 const WATER_CACHE_FILE = path.resolve(__dirname, '..', '..', 'cache', 'water-accounts.json');
-const OFFLINE_LOG_DIR  = path.resolve(__dirname, '..', '..', 'cache');
+const OFFLINE_LOG_DIR = path.resolve(__dirname, '..', '..', 'cache');
 const WATER_OFFLINE_LOG = path.join(OFFLINE_LOG_DIR, 'water-run-offline.jsonl');
-const BGE_OFFLINE_LOG   = path.join(OFFLINE_LOG_DIR, 'bge-run-offline.jsonl');
+const BGE_OFFLINE_LOG = path.join(OFFLINE_LOG_DIR, 'bge-run-offline.jsonl');
 
 // When set to true (auto on first ECONNRESET/ENOTFOUND etc., or explicitly via
 // DB_OFFLINE=1), log writes go to a JSONL file in /cache instead of Postgres.
@@ -197,6 +197,7 @@ export interface AuditEvent {
   property_id: number | null;
   action: string;
   status: string;
+  run_id?: string | null;
   // bge identity
   bge_account_number?: string;
   // water identity
@@ -222,8 +223,11 @@ export async function logAuditEvent(e: AuditEvent): Promise<void> {
     console.warn(`[BGE] Skipping audit-log write for ${e.bge_account_number} — no property_id (unmatched to hub.property).`);
     return;
   }
+
+  const runId = process.env.RUN_ID ?? 'not found';
+
   if (dbOffline) {
-    appendOfflineLog(offlineFile, e);
+    appendOfflineLog(offlineFile, { ...e, run_id: runId });
     return;
   }
 
@@ -233,24 +237,38 @@ export async function logAuditEvent(e: AuditEvent): Promise<void> {
     if (e.entity === 'bge') {
       await client.query(
         `INSERT INTO ${AUDIT_SCHEMA}.bge_portal_audit_log
-           (bge_account_number, property_id, action, status, bill_amount, due_date, notes, run_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-         ON CONFLICT DO NOTHING`,
+           (run_id, bge_account_number, property_id, action, status, bill_amount, due_date, notes, run_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         ON CONFLICT (run_id, bge_account_number, action) DO UPDATE SET
+           status = EXCLUDED.status,
+           bill_amount = COALESCE(EXCLUDED.bill_amount, ${AUDIT_SCHEMA}.bge_portal_audit_log.bill_amount),
+           due_date = COALESCE(EXCLUDED.due_date, ${AUDIT_SCHEMA}.bge_portal_audit_log.due_date),
+           notes = EXCLUDED.notes,
+           run_at = NOW()`,
         [
-          e.bge_account_number, e.property_id, e.action, e.status,
+          runId, e.bge_account_number, e.property_id, e.action, e.status,
           e.bill_amount ?? null, e.due_date ?? null, e.notes ?? null,
         ]
       );
     } else {
       await client.query(
         `INSERT INTO ${AUDIT_SCHEMA}.water_portal_audit_log
-           (unit_id, property_id, action, status, bill_amount,
+           (run_id, unit_id, property_id, action, status, bill_amount,
             consumption_units, due_date, threshold_action, notes,
             period_start, period_end, run_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-         ON CONFLICT DO NOTHING`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+         ON CONFLICT (run_id, unit_id, action) DO UPDATE SET
+           status = EXCLUDED.status,
+           bill_amount = COALESCE(EXCLUDED.bill_amount, ${AUDIT_SCHEMA}.water_portal_audit_log.bill_amount),
+           consumption_units = COALESCE(EXCLUDED.consumption_units, ${AUDIT_SCHEMA}.water_portal_audit_log.consumption_units),
+           due_date = COALESCE(EXCLUDED.due_date, ${AUDIT_SCHEMA}.water_portal_audit_log.due_date),
+           threshold_action = COALESCE(EXCLUDED.threshold_action, ${AUDIT_SCHEMA}.water_portal_audit_log.threshold_action),
+           notes = EXCLUDED.notes,
+           period_start = COALESCE(EXCLUDED.period_start, ${AUDIT_SCHEMA}.water_portal_audit_log.period_start),
+           period_end = COALESCE(EXCLUDED.period_end, ${AUDIT_SCHEMA}.water_portal_audit_log.period_end),
+           run_at = NOW()`,
         [
-          e.unit_id, e.property_id, e.action, e.status,
+          runId, e.unit_id, e.property_id, e.action, e.status,
           e.bill_amount ?? null, e.consumption_units ?? null,
           e.due_date ?? null, e.threshold_action ?? null, e.notes ?? null,
           e.period_start ?? null, e.period_end ?? null,
@@ -263,7 +281,7 @@ export async function logAuditEvent(e: AuditEvent): Promise<void> {
         dbOffline = true;
         console.warn(`[DB] Connection lost (${err.code}). Switching to OFFLINE mode — subsequent log writes go to ${offlineFile}`);
       }
-      appendOfflineLog(offlineFile, e);
+      appendOfflineLog(offlineFile, { ...e, run_id: runId });
       return;
     }
     throw err;
@@ -312,6 +330,13 @@ export async function recordRoutingFeedback(params: {
   feedback_text: string;
   submitted_by?: string | null;
 }): Promise<void> {
+  const offlineFile = path.join(OFFLINE_LOG_DIR, 'routing-feedback-offline.jsonl');
+
+  if (dbOffline) {
+    appendOfflineLog(offlineFile, params);
+    return;
+  }
+
   let client: PoolClient | null = null;
   try {
     client = await getPool().connect();
@@ -320,8 +345,18 @@ export async function recordRoutingFeedback(params: {
          (run_id, property_id, utility, feedback_text, submitted_by)
        VALUES ($1,$2,$3,$4,$5)`,
       [params.run_id, params.property_id, params.utility ?? null,
-       params.feedback_text, params.submitted_by ?? null]
+      params.feedback_text, params.submitted_by ?? null]
     );
+  } catch (err: any) {
+    if (isDbUnavailableError(err)) {
+      if (!dbOffline) {
+        dbOffline = true;
+        console.warn(`[DB] Connection lost (${err.code}). Switching to OFFLINE mode — subsequent log writes go to ${offlineFile}`);
+      }
+      appendOfflineLog(offlineFile, params);
+      return;
+    }
+    throw err;
   } finally {
     client?.release();
   }
@@ -426,8 +461,8 @@ export async function recordPaymentAttempt(params: {
              updated_at       = NOW()
          WHERE public.payment_attempt.status NOT IN ('CONFIRMED')`,
       [params.run_id, params.property_id, params.unit_id ?? null, params.utility,
-       params.account_number, key, params.amount, params.status,
-       params.confirmation_ref ?? null, params.error ?? null]
+      params.account_number, key, params.amount, params.status,
+      params.confirmation_ref ?? null, params.error ?? null]
     );
   } catch (err: any) {
     console.error(`[DB] Failed to record payment_attempt for ${params.account_number}: ${err?.message ?? err}`);
